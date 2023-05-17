@@ -1,0 +1,524 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<graph name="MarketplacePaymentCaptureWorkflow" singletonBehavior="discard" initialState="VERIFY_TRANSACTION_PERSISTED">
+
+    <description>Graph for Capture Workflow for MarketplacePayments (live).</description>
+
+    <!-- The default sil is MarketplacePaymentSIL. By default, each state can be visited only once. And while executing a state, 
+        herd will make max 10 attempts to execute it. See https://w.amazon.com/index.php/Herd/Graph#Common_Attributes for more details 
+        on attributes -->
+    
+    <!--IMPORTANT:
+            Rerun of the work-flow will also generate the Notification Events. In case, external IPN framework is not responsible for 
+            idempotent check, re-run might result in duplicate IPNs on merchant's end. 
+    -->
+    <!-- TODO: currently modifying the workflow with hight number of Max visit numbers, will optimize this once the code reaches to prod and we verify the flow for both
+     Happy and Unhappy case -->
+    <arh-state-defaults sil="MarketplacePaymentSIL" maxVisits="3" maxAttempts="10">
+        <!-- All states will pick up this metadata pair. -->
+        <!-- An arc can go here as well that will be picked up by every ARH state. -->
+    </arh-state-defaults>
+
+	<!-- Retry added at the activity level -->
+    <arh-state name="VERIFY_TRANSACTION_PERSISTED" actionRequest="verifyTransactionPersisted" retryInterval="1s" retryWindow="1s" maxAttempts="5" retryBackoffFactor="0.4">
+        <!-- Transaction persisted successfully, resume the ORO notification workflow. -->
+        <arc actionComplete="VerifyTransactionStoredSuccess" goto="RESUME_ORO_NOTIFICATION_WORKFLOW" />
+
+        <arc actionComplete="VerifyTransactionStoredFailure" goto="VERIFY_TRANSACTION_PERSISTED::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- oro notification sent; now check if the transaction is marked as fraud or not -->
+    <arh-state name="RESUME_ORO_NOTIFICATION_WORKFLOW" actionRequest="resumeOrderReferenceNotificationWorkflow">
+        <arc actionComplete="ResumeWorkflowSuccess" goto="CHECK_CAPTURE_STATE_FOR_FRAUD" />
+        <arc actionComplete="WorkflowNotAvailableForResumption" goto="CHECK_CAPTURE_STATE_FOR_FRAUD" />
+
+        <!-- Since the Notification workflow will anyway wake up after max 5 mins, we won't fail the capture workflow if resuming 
+             the notification workflow fails. -->
+        <arc actionComplete="ResumeWorkflowFailure" goto="CHECK_CAPTURE_STATE_FOR_FRAUD" />
+    </arh-state>
+    
+    <!--
+        Workflow step to make decision on the basis of fraud state. 
+        Case Fraud:
+            Case merchantStatus == Completed : skip PPCS call; Send IPN 
+            Case merchantStatus == Declined  : skip PPCS call; Send IPN
+        Case No-fraud:
+            Proceed to PPCS call. 
+     -->
+    <arh-state name="CHECK_CAPTURE_STATE_FOR_FRAUD" actionRequest="checkCaptureState">
+
+                <!-- Fraud states detected, skipping the PPCS call. -->
+                <arc actionComplete="CaptureSkippedDueToBuyerFraud" goto="SKIPPED_CAPTURE_CHECK_FOR_PROVIDER_TRANSACTIONS"/>
+                <arc actionComplete="CaptureCompletedWithBadDebt" goto="CHECK_FOR_PROVIDER_TRANSACTIONS"/>
+                <arc actionComplete="CaptureMerchantStatusDeclined" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+
+                <!-- Not a fraud state. Continuing with PPCS call -->
+                <arc actionComplete="CaptureMerchantStatusPending" goto="CHECK_AUTHORIZE_PAYMENT_PROCESSOR_STATE" />
+                <arc actionComplete="CapturePaymentProcessorStatusPending" goto="CHECK_AUTHORIZE_PAYMENT_PROCESSOR_STATE" />
+                
+                <!-- Just to make sure that all the steps are re-executed in case a work-flow re-run is requested -->
+                <arc actionComplete="CaptureCompletedSuccessfully" goto="PAYMENT_REQUEST" />
+                <arc actionComplete="CaptureCompletedWithPaymentProcessorPendingCallbackResponse" goto="CHECK_FOR_PRENOTIFICATION" />
+                <arc actionComplete="CaptureCanceled" goto="CAPTURE_COMPLETE" />
+                <arc actionComplete="CaptureMerchantStatusClosed" goto="CAPTURE_COMPLETE" />
+                <!-- In case of retryPending trigger the retry WF, if re-run -->
+                <arc actionComplete="CaptureCompletedWithBadDebtRecoveryPending" goto="TRIGGER_CAPTURE_RETRY_WF" />
+                <arc actionComplete="UpfrontChargeCaptureFailure" goto="CHECK_CAPTURE_STATE_FOR_FRAUD::Error::ExecutionError" />
+                <arc actionComplete="CheckCaptureStateFailure" goto="CHECK_CAPTURE_STATE_FOR_FRAUD::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Branch if provider transaction is requested -->
+    <branch-state name="SKIPPED_CAPTURE_CHECK_FOR_PROVIDER_TRANSACTIONS" defaultArc="NoProviderTransaction">
+        <arc actionComplete="NoProviderTransaction" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE" />
+        <arc actionComplete="HasProviderTransactions" goto="SKIPPED_CAPTURE_PERSIST_PROVIDER_TRANSACTIONS" />
+    </branch-state>
+
+    <arh-state name="SKIPPED_CAPTURE_PERSIST_PROVIDER_TRANSACTIONS" actionRequest="persistProviderTransaction" retryInterval="1s" retryWindow="1s">
+        <arc actionComplete="Success" goto="SKIPPED_CAPTURE_TRIGGER_PROVIDER_WORKFLOWS"/>
+        <arc actionComplete="PaymentTransactionMerchantStateDeclinedResponse" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE"/>
+        <arc actionComplete="NoProviderTransactionToPersist" goto="PERSIST_PROVIDER_TRANSACTIONS::Error::ExecutionError"/>
+        <arc actionComplete="Failure" goto="PERSIST_PROVIDER_TRANSACTIONS::Error::ExecutionError"/>
+    </arh-state>
+
+    <arh-state name="SKIPPED_CAPTURE_TRIGGER_PROVIDER_WORKFLOWS" actionRequest="triggerProviderTransactionWorkflows" retryInterval="2m">
+        <metadata key="eventType" value="CaptureExecutionDetails" />
+        <arc actionComplete="Success" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE" />
+        <arc actionComplete="Failure" goto="TRIGGER_PROVIDER_WORKFLOWS::Error::ExecutionError" />
+    </arh-state>
+    <!--
+        The state assumes that the workflow if triggered authorize status is either open or closed(approved) 
+     -->
+    <arh-state name="CHECK_AUTHORIZE_PAYMENT_PROCESSOR_STATE" actionRequest="checkAuthorizePaymentProcessorState" retryInterval="2m" maxVisits="5">
+
+        <arc actionComplete="AuthorizePaymentProcessorStatusApproved" goto="CHECK_FOR_PRENOTIFICATION" />
+        <arc actionComplete="AuthorizePaymentProcessorStatusSoftDeclinePendingAutoRetry" goto="CHECK_FOR_TRANSACTIONS_WITHIN_GUARANTEE_PERIOD" />
+        <arc actionComplete="AuthorizePaymentProcessorStatusPending" goto="CHECK_AUTHORIZE_PAYMENT_PROCESSOR_STATE::Error::ExecutionError" />
+        <arc actionComplete="AuthorizeScoringServiceApproved" goto="WAIT_FOR_AUTHORIZE_SUCCESS_OR_FAIL" />
+        <arc actionComplete="AuthorizePaymentProcessorStatusAck" goto="WAIT_FOR_AUTHORIZE_SUCCESS_OR_FAIL" />
+        <arc actionComplete="AuthorizePaymentProcessorStatusMissingAndProcessedInSync" goto="WAIT_FOR_AUTHORIZE_SUCCESS_OR_FAIL" />
+
+        <arc actionComplete="AuthorizePaymentProcessorStatusFailed" goto="UPDATE_CAPTURE_FOR_NON_APPROVED_AUTHORIZE" />
+	<!-- We are unlikely to get CAck/CApproved in Capture so Erroring out the 
+		workflow for future checking -->
+	<arc actionComplete="AuthorizePaymentProcessorStatusCAck"
+		goto="CHECK_AUTHORIZE_PAYMENT_PROCESSOR_STATE::Error::ExecutionError" />
+	<arc actionComplete="AuthorizePaymentProcessorStatusCApproved"
+		goto="CHECK_AUTHORIZE_PAYMENT_PROCESSOR_STATE::Error::ExecutionError" />
+        <arc actionComplete="CheckAuthorizePaymentProcessorStateFailure" goto="CHECK_AUTHORIZE_PAYMENT_PROCESSOR_STATE::Error::ExecutionError" />
+    </arh-state>     
+    
+    <!-- Authorize Workflow will resume this flow after it gets response from PPCS -->
+    <wait-state name="WAIT_FOR_AUTHORIZE_SUCCESS_OR_FAIL" timeout="24h" timeoutArc="TimeoutOccurred" maxVisits="10">
+        <!-- Authorize Approved (In Seals) -->
+        <arc actionComplete="ResumeWorkflowForApprovedAuth" goto="CHECK_FOR_PRENOTIFICATION" deferralBehavior="mergeAllForward"/>
+        <!-- Authorize Non Approved-->
+        <arc actionComplete="ResumeWorkflowForNonApprovedAuth" goto="UPDATE_CAPTURE_FOR_NON_APPROVED_AUTHORIZE" deferralBehavior="mergeAllForward"/>
+        <!-- Authorize Pending for Auto Retry-->
+        <arc actionComplete="ResumeWorkflowForRetryPendingAuth" goto="CHECK_FOR_TRANSACTIONS_WITHIN_GUARANTEE_PERIOD" deferralBehavior="none"/>
+        <arc actionComplete="TimeoutOccurred" goto="CHECK_AUTHORIZE_PAYMENT_PROCESSOR_STATE" />
+    </wait-state>
+
+    <!-- Branch if provider transaction is requested -->
+    <branch-state name="CHECK_FOR_TRANSACTIONS_WITHIN_GUARANTEE_PERIOD" defaultArc="CaptureOutsideGuaranteePeriod">
+        <arc actionComplete="CaptureOutsideGuaranteePeriod" goto="CHECK_AUTHORIZE_PAYMENT_PROCESSOR_STATE" />
+        <arc actionComplete="CaptureWithinGuaranteePeriod" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+    </branch-state>
+    
+    <arh-state name="UPDATE_CAPTURE_FOR_NON_APPROVED_AUTHORIZE" actionRequest="updateCaptureForNonApprovedAuthorize" retryInterval="2m">
+        <arc actionComplete="captureUpdatedForBadDebt" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+        <arc actionComplete="captureUpdatedToDecline" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+        <arc actionComplete="Failure" goto="UPDATE_CAPTURE_FOR_NON_APPROVED_AUTHORIZE::Error::ExecutionError" />
+    </arh-state>
+
+    <branch-state name="CHECK_FOR_PRENOTIFICATION" defaultArc="IsNotPrenotification">
+        <arc actionComplete="IsNotPrenotification" goto="PAYMENT_REQUEST" />
+        <arc actionComplete="IsPrenotification" goto="TRIGGER_PRENOTIFICATION_WORKFLOW" />
+    </branch-state>
+
+    <subgraph-state name="TRIGGER_PRENOTIFICATION_WORKFLOW" clientId="marketplace-payments-dev" instructionId="MarketplacePaymentPrenotificationWorkflow" inheritContext="true">
+        <arc actionComplete="SubgraphExitedViaEXIT_PRENOTIFICATION_PERIOD" goto="PAYMENT_REQUEST" />
+        <arc actionComplete="SubgraphExitedViaBUYER_CANCELED" goto="CAPTURE_COMPLETE" />
+        <arc actionComplete="SubgraphExitedViaFailure" goto="TRIGGER_PRENOTIFICATION_WORKFLOW::Error::ExecutionError" />
+    </subgraph-state>
+
+    <arh-state name="PAYMENT_REQUEST" actionRequest="paymentRequest" retryInterval="2m">
+
+        <!-- PPCS call over, update the merchant facing status (PaymentStatus) based on the Ack/Nack returned in sync -->
+        <arc actionComplete="PaymentRequestSuccess" goto="UPDATE_MERCHANT_TRANSACTION_STATUS" />
+
+        <arc actionComplete="PaymentRequestFailure" goto="PAYMENT_REQUEST::Error::ExecutionError" />
+    </arh-state>
+
+    <arh-state name="UPDATE_MERCHANT_TRANSACTION_STATUS" actionRequest="updateMerchantTransactionStatus"
+        retryInterval="30s">
+        <arc actionComplete="MerchantTransactionStatusUpdatedToDecline" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+        <!--  To assist workflow re-runs -->
+        <arc actionComplete="MerchantTransactionStatusAlreadyDeclined" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+        <arc actionComplete="MerchantTransactionStatusNotUpdated" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE_AFTER_PPCS_CALL" />
+        <arc actionComplete="UpdateMerchantTransactionStatusFailure" goto="UPDATE_MERCHANT_TRANSACTION_STATUS::Error::ExecutionError" />
+    </arh-state>
+
+    <arh-state name="CHECK_CAPTURE_STATE_FOR_COMPLETE_AFTER_PPCS_CALL" actionRequest="checkCaptureState"
+        maxVisits="5" retryInterval="2m">
+
+        <!-- PaymentStatus is pending. This is only possible if capture was done after guarantee period of authorize. -->
+        <arc actionComplete="CaptureMerchantStatusPending" goto="PPCS_CALLBACK_WAIT_FOR_CAPTURE_BEYOND_GUARANTEE_PERIOD" />
+
+        <!-- Capture has been declined. Send Notification -->
+        <arc actionComplete="CaptureMerchantStatusDeclined" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+
+        <!-- Capture is COMPLETE but PaymentProcessorStatus is not terminal (Capture within guarantee period of authorize). Send 
+            Notification. -->
+        <arc actionComplete="CaptureCompletedWithPaymentProcessorPendingCallbackResponse" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+
+        <arc actionComplete="CaptureCompletedWithBadDebt" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+        <arc actionComplete="CaptureCompletedSuccessfully" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" />
+        <arc actionComplete="UpfrontChargeCaptureFailure" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE_AFTER_PPCS_CALL::Error::ExecutionError" />        
+        <arc actionComplete="CheckCaptureStateFailure" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE_AFTER_PPCS_CALL::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Wait till Seals callback is received, the timeout is set to 72 hrs 
+        (https://w.amazon.com/bin/view/AmazonPay/PYOP/Research/ExtendProcessorCallbackLatency/)
+        (Seals SLA details - https://w.amazon.com/index.php/SEALS/ClientGuide/SLAsAndMetrics). 
+        If timeout occurs, we re-execute "CHECK_CAPTURE_STATE_FOR_COMPLETE_AFTER_PPCS_CALL". 
+        If the PaymentStatus is still pending,Herd will try to move the graph back to this state. 
+        But that will fail because the max visits of this state is set to 1.
+         
+        This has been done to avoid the following rare edge case (T1 to T5 is in increasing order of time i.e. T(i+1) > T(i) ) 
+        T1. CHECK_CAPTURE_STATE_FOR_COMPLETE_AFTER_PPCS_CALL returns CaptureMerchantStatusPending 
+        to move the graph to wait state.
+        T2. PPCS callback arrives, the transaction state is updated. 
+        T3. The async handler tries to resume the graph from the wait state but the graph is not in the wait state yet. So nothing 
+        is resumed. 
+        T4. Herd moves graph to wait state PPCS_CALLBACK_WAIT_FOR_CAPTURE_BEYOND_GUARANTEE_PERIOD. 
+        T5. Since the callback is already over, the graph is never resumed from the wait state and thus times out 
+        
+        -->
+    <wait-state name="PPCS_CALLBACK_WAIT_FOR_CAPTURE_BEYOND_GUARANTEE_PERIOD" timeout="72h" timeoutArc="TimeoutOccurred"
+        maxVisits="1">
+        <!-- PPCS callback handler has completed the transaction and resumed this graph from wait. -->
+        <arc actionComplete="PPCSCallbackWaitOver" goto="CHECK_FOR_PROVIDER_TRANSACTIONS" deferralBehavior="mergeAllForward"/>
+        <arc actionComplete="TimeoutOccurred" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE_AFTER_PPCS_CALL"/>
+    </wait-state>
+
+    <!-- Update authorize (if needed). For example, if the entire auth amount has been captured, then auth should be closed. -->
+    <arh-state name="UPDATE_AUTHORIZE" actionRequest="updateAuthorizeForCapture" retryInterval="30s" maxAttempts="100" retryBackoffFactor="0.4">
+        <arc actionComplete="UpdateAuthorizeForCaptureSuccess" goto="DECIDE_CONTRACT_STATE" />
+        <arc actionComplete="UpdateAuthorizeForCaptureFailure" goto="UPDATE_AUTHORIZE::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Check if contract state needs to be updated. For example if the authorize was closed and this was the 10th partially/fully 
+        captured authorize, then update ORO to CLOSED -->
+    <arh-state name="DECIDE_CONTRACT_STATE" actionRequest="decideContractStateForCapture" retryInterval="30s">
+        <arc actionComplete="UpdateContractState" goto="UPDATE_CONTRACT_STATE" />
+        <arc actionComplete="DoNotUpdateContractState" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE" />
+        <arc actionComplete="DecideContractStateUpdateFailure" goto="DECIDE_CONTRACT_STATE::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Update the contract state. -->
+    <arh-state name="UPDATE_CONTRACT_STATE" actionRequest="updateContractState" retryInterval="30s">
+       <arc actionComplete="ContractStateUpdatedToTerminalState" goto="RESUME_ORDER_REFERENCE_EXPIRATION_WORKFLOW" />
+       <arc actionComplete="ContractStateUpdatedToNonTerminalState" goto="UPDATE_CONTRACT_STATE::Error::ExecutionError" />
+       <arc actionComplete="ContractStateNotUpdated" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE" />
+       <arc actionComplete="ContractInternalStateUpdated" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE" />
+       <arc actionComplete="UpdateContractStateFailure" goto="UPDATE_CONTRACT_STATE::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Resume expiration workflow -->
+    <arh-state name="RESUME_ORDER_REFERENCE_EXPIRATION_WORKFLOW" actionRequest="resumeOrderReferenceExpirationWorkflow">
+        <arc actionComplete="ResumeOrderReferenceExpirationWorkflowSuccess" goto="CONTRACT_NOTIFICATION" />
+        <arc actionComplete="ResumeOrderReferenceExpirationWorkflowFailure" goto="RESUME_ORDER_REFERENCE_EXPIRATION_WORKFLOW::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Send the IPN for contract updation -->
+    <arh-state name="CONTRACT_NOTIFICATION" actionRequest="paymentCreationNotification" retryInterval="30s">
+        <arc actionComplete="PaymentNotificationSuccess" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE" />
+        <arc actionComplete="PaymentNotificationFailure" goto="CONTRACT_NOTIFICATION::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Check if capture is complete. If yes, post fees -->
+    <arh-state name="CHECK_CAPTURE_STATE_FOR_COMPLETE" actionRequest="checkCaptureState" retryInterval="30s">
+        <!-- Capture has been declined, send declined notification then resume child refund workflows -->
+        <arc actionComplete="CaptureMerchantStatusDeclined" goto="CAPTURE_DECLINED_NOTIFICATION" />
+
+        <!-- Capture is COMPLETE (but PaymentProcessorStatus is not terminal). Post fees. -->
+        <arc actionComplete="CaptureCompletedWithPaymentProcessorPendingCallbackResponse" goto="BEGIN_EVENT_IN_SEA" />
+        <arc actionComplete="CapturePaymentProcessorStatusPending" goto="BEGIN_EVENT_IN_SEA" />
+        <arc actionComplete="CaptureSkippedDueToBuyerFraud" goto="BEGIN_EVENT_IN_SEA" />
+        <arc actionComplete="CaptureCompletedWithBadDebt" goto="BEGIN_EVENT_IN_SEA" />
+        <arc actionComplete="CaptureCompletedSuccessfully" goto="BEGIN_EVENT_IN_SEA" />
+        <arc actionComplete="CheckCaptureStateFailure" goto="CHECK_CAPTURE_STATE_FOR_COMPLETE::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- SEA must be called before any of the SEA data parts are posted for this transaction.
+    This includes FEE service which will post on our behalf. -->
+    <arh-state name="BEGIN_EVENT_IN_SEA" actionRequest="sendBeginEventToSEA" retryInterval="2m">
+        <arc actionComplete="SendBeginEventToSEASuccess" goto="CONFIGURE_FEES" />
+        <arc actionComplete="SendBeginEventToSEAFailure" goto="BEGIN_EVENT_IN_SEA::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Configures Fees when POE is changed -->
+    <arh-state name="CONFIGURE_FEES" actionRequest="configureFees" retryInterval="5m">
+        <arc actionComplete="Success" goto="POST_FEES" />
+        <arc actionComplete="Failure" goto="CONFIGURE_FEES::Error::ExecutionError" />
+    </arh-state>
+
+    <arh-state name="POST_FEES" actionRequest="calculateFees" retryInterval="5m">
+        <arc actionComplete="CalculateFeesSuccess" goto="PERSIST_FEE" />
+        <arc actionComplete="CalculateFeesFailure" goto="POST_FEES::Error::ExecutionError" />
+    </arh-state>
+
+    <arh-state name="PERSIST_FEE" actionRequest="persistFee" retryInterval="5m">
+        <arc actionComplete="PersistFeeSuccess" goto="CAPTURE_COMPLETE_NOTIFICATION" />
+        <arc actionComplete="PersistFeeFailure" goto="PERSIST_FEE::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Send Capture Complete Notification -->
+    <arh-state name="CAPTURE_COMPLETE_NOTIFICATION" actionRequest="paymentNotification" retryInterval="30s">
+        <arc actionComplete="PaymentNotificationSuccess" goto="POST_CAM_DATA_TO_SEA" />
+        <arc actionComplete="PaymentNotificationFailure" goto="CAPTURE_COMPLETE_NOTIFICATION::Error::ExecutionError" />
+    </arh-state>
+    
+    <!-- SEA related posting activities -->
+    <arh-state name="POST_CAM_DATA_TO_SEA" actionRequest="postCAMDataToSEA" retryInterval="2m">
+        <arc actionComplete="PostDataToSEASuccess" goto="CHECK_FOR_EARLY_SETTLEMENT" />
+        <arc actionComplete="PostDataToSEAFailure" goto="POST_CAM_DATA_TO_SEA::Error::ExecutionError" />
+    </arh-state>
+
+    <arh-state name="CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" actionRequest="checkCaptureState" retryInterval="30s">
+
+        <!-- Capture is COMPLETE (but PaymentProcessorStatus is not terminal). Wait till the callback is received. -->
+        <arc actionComplete="CaptureCompletedWithPaymentProcessorPendingCallbackResponse" goto="PPCS_CALLBACK_WAIT_FOR_CAPTURE_WITHIN_GUARANTEE_PERIOD" />
+        <arc actionComplete="CaptureCompletedWithBadDebtRecoveryPending" goto="TRIGGER_CAPTURE_RETRY_WF" />
+        <arc actionComplete="CaptureSkippedDueToBuyerFraud" goto="TRIGGER_SKIPPED_CAPTURE_RETRY_WORKFLOW" />
+        <arc actionComplete="CaptureCompletedWithBadDebt" goto="DECIDE_BAD_DEBT_FOR_CAPTURE" />
+        <arc actionComplete="CaptureCompletedSuccessfully" goto="EXECUTION_DETAILS_AVAILABLE_NOTIFICATION" />
+        <arc actionComplete="CapturePaymentProcessorStatusPending" goto="WAIT_FOR_AUTHORIZE_SUCCESS_OR_FAIL" />
+        <arc actionComplete="CheckCaptureStateFailure" goto="CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS::Error::ExecutionError" />
+    </arh-state>
+
+    <subgraph-state name="TRIGGER_SKIPPED_CAPTURE_RETRY_WORKFLOW" clientId="marketplace-payments-dev" instructionId="MarketplacePaymentSkippedCaptureRetryWorkflow" inheritContext="true">
+        <arc actionComplete="SubgraphExitedViaNO_RETRY_REQUIRED" goto="DECIDE_BAD_DEBT_FOR_CAPTURE" />
+        <arc actionComplete="SubgraphExitedViaCAPTURE_RETRIES_COMPLETE" goto="CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+        <arc actionComplete="SubgraphExitedViaCAPTURE_COMPLETE" goto="CAPTURE_COMPLETE" />
+        <arc actionComplete="SubgraphExitedViaFailure" goto="TRIGGER_SKIPPED_CAPTURE_RETRY_WORKFLOW::Error::ExecutionError" />
+    </subgraph-state>
+
+    <subgraph-state name="TRIGGER_CAPTURE_RETRY_WF" clientId="marketplace-payments-dev" instructionId="MarketplacePaymentCaptureRetryWorkflow" inheritContext="true">
+        <arc actionComplete="SubgraphExitedViaNO_RETRY_REQUIRED" goto="CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+        <arc actionComplete="SubgraphExitedViaCAPTURE_RETRIES_COMPLETE" goto="CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+        <arc actionComplete="SubgraphExitedViaFailure" goto="TRIGGER_CAPTURE_RETRY_WF::Error::ExecutionError" />
+    </subgraph-state>
+
+    <!-- Wait till Seals callback is received, the timeout is set to 72 hrs
+        (https://w.amazon.com/bin/view/AmazonPay/PYOP/Research/ExtendProcessorCallbackLatency)
+        (Seals SLA details - https://w.amazon.com/index.php/SEALS/ClientGuide/SLAsAndMetrics). 
+        If timeout occurs, we re-execute "CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS". 
+        If the PaymentStatus is still pending,Herd will try to move the graph back to this state. 
+        But that will fail because the max visits of this state is set to 1.
+         
+        This has been done to avoid the following rare edge case (T1 to T5 is in increasing order of time i.e. T(i+1) > T(i) ) 
+        T1. PPCS_CALLBACK_WAIT_FOR_CAPTURE_WITHIN_GUARANTEE_PERIOD returns CaptureMerchantStatusPending 
+        to move the graph to wait state.
+        T2. PPCS callback arrives, the transaction state is updated. 
+        T3. The async handler tries to resume the graph from the wait state but the graph is not in the wait state yet. So nothing 
+        is resumed. 
+        T4. Herd moves graph to wait state PPCS_CALLBACK_WAIT_FOR_CAPTURE_BEYOND_GUARANTEE_PERIOD. 
+        T5. Since the callback is already over, the graph is never resumed from the wait state and thus times out 
+        
+        -->
+    <wait-state name="PPCS_CALLBACK_WAIT_FOR_CAPTURE_WITHIN_GUARANTEE_PERIOD" timeout="72h" timeoutArc="TimeoutOccurred"
+        maxVisits="1">
+        <arc actionComplete="PPCSCallbackWaitOver" goto="CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" deferralBehavior="mergeAllForward" />
+        <arc actionComplete="TimeoutOccurred" goto="CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+    </wait-state>
+
+    <!-- Check if bad debt needs to be post. e.g. we don't post bad debt for Direct Debit since PPS will try to recover it first -->
+    <arh-state name="DECIDE_BAD_DEBT_FOR_CAPTURE" actionRequest="decideBadDebtForCapture" retryInterval="2m">
+     <arc actionComplete="SkipRegisterBadDebt" goto="POST_EXECUTION_DETAILS_DATA_TO_SEA"/>
+     <arc actionComplete="RegisterBadDebt" goto="REGISTER_BAD_DEBT_ACCOUNTING"/>
+     <arc actionComplete="DecideBadDebtFailure" goto="DECIDE_BAD_DEBT_FOR_CAPTURE::Error::ExecutionError" />
+    </arh-state>
+
+    <arh-state name="REGISTER_BAD_DEBT_ACCOUNTING" actionRequest="postBadDebtEventToSEA" retryInterval="2m">
+     <!-- Bad Debt is to be registered in accounting for this transaction -->
+     <metadata key="eventType" value="CaptureBadDebtEvent" />
+     <arc actionComplete="Success" goto="POST_EXECUTION_DETAILS_DATA_TO_SEA"/>
+     <arc actionComplete="Failure" goto="REGISTER_BAD_DEBT_ACCOUNTING::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Send Notification for payment processing completion from PPCS -->
+    <arh-state name="EXECUTION_DETAILS_AVAILABLE_NOTIFICATION"
+        actionRequest="paymentNotification" retryInterval="30s">
+        <metadata key="eventType" value="CaptureExecutionDetails" />
+        <arc actionComplete="PaymentNotificationSuccess" goto="POST_EXECUTION_DETAILS_DATA_TO_SEA" />
+        <arc actionComplete="PaymentNotificationFailure" goto="EXECUTION_DETAILS_AVAILABLE_NOTIFICATION::Error::ExecutionError" />
+    </arh-state>
+    
+    <!-- maxVists = POST_EXECUTION_DETAILS_WAIT_STATE + 1 -->
+    <arh-state name="POST_EXECUTION_DETAILS_DATA_TO_SEA" actionRequest="postExecutionDetailsDataToSEA" retryInterval="2m" maxVisits="11">
+        <arc actionComplete="PostDataToSEASuccess" goto="POST_TRANSACTION_DATA_TO_SEA" />
+        <arc actionComplete="PostDataToSEANoData" goto="POST_EXECUTION_DETAILS_WAIT_STATE" />
+        <arc actionComplete="PostDataToSEAFailure" goto="POST_EXECUTION_DETAILS_DATA_TO_SEA::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- There may be a delay between postResponse update in MPS and the data being available in HOPS. Allow ~4 hours
+         See https://tt.amazon.com/0025572861 -->
+    <wait-state name="POST_EXECUTION_DETAILS_WAIT_STATE" timeout="15s" timeoutArc="TimeoutOccurred" timeoutBackoffFactor="1" maxVisits="10">
+        <arc actionComplete="TimeoutOccurred" goto="POST_EXECUTION_DETAILS_DATA_TO_SEA" />
+    </wait-state>
+    
+    <arh-state name="POST_TRANSACTION_DATA_TO_SEA" actionRequest="postTransactionDataToSEA" retryInterval="2m">
+        <arc actionComplete="PostDataToSEASuccess" goto="IS_POST_UPFRONT_CHARGE_DETAILS_TO_SEA_REQUIRED" />
+        <arc actionComplete="PostDataToSEAFailure" goto="POST_TRANSACTION_DATA_TO_SEA::Error::ExecutionError" />
+    </arh-state>
+
+    <branch-state name="IS_POST_UPFRONT_CHARGE_DETAILS_TO_SEA_REQUIRED" defaultArc="PostUpfrontChargeDetailsToSEANotRequired">
+        <arc actionComplete="EUAmazon" goto="POST_UPFRONT_CHARGE_DETAILS_TO_SEA" />
+        <arc actionComplete="PostUpfrontChargeDetailsToSEANotRequired" goto="RESUME_CHILDREN_REFUND_WORKFLOW"/>
+    </branch-state>
+
+    <arh-state name="POST_UPFRONT_CHARGE_DETAILS_TO_SEA" actionRequest="postUpfrontChargeDetailsToSEA" retryInterval="2m">
+        <arc actionComplete="UpfrontChargePayloadRequired" goto="POST_UPFRONT_CHARGE_DATA_TO_SEA" />
+        <arc actionComplete="PostUpfrontChargeDetailsToSEASuccess" goto="RESUME_CHILDREN_REFUND_WORKFLOW" />
+        <arc actionComplete="PostUpfrontChargeDetailsToSEAFailure" goto="POST_UPFRONT_CHARGE_DETAILS_TO_SEA::Error::ExecutionError" />
+    </arh-state>
+
+    <arh-state name="POST_UPFRONT_CHARGE_DATA_TO_SEA" actionRequest="postMarketplacePaymentUpfrontChargeDetailsToSEA" sil="KuberSIL" retryInterval="2m">
+        <arc actionComplete="PostUpfrontChargeDataToSEASuccess" goto="RESUME_CHILDREN_REFUND_WORKFLOW" />
+        <arc actionComplete="PostUpfrontChargeDataToSEAFailure" goto="POST_UPFRONT_CHARGE_DATA_TO_SEA::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Branch if early settlement is requested. This branch will be removed and only early settlement flow will remain 
+    after dialing up weblab - MPS_SETTLE_EARLY_98897 to 100% in production.
+    Note: This is applicable for CBEV1 flow. There is a cleaner solution when migrating to CBEV2, where SEA posting of 
+    FEE, CAMRequest and MarketplaceTransactionDetails as part of EPSOPayment event can be done without getting final 
+    response from PPCS within guarantee period scenario. SEA will trigger disbursement after receiving these event parts. 
+    However, SEA will wait for PaymentExecutionDetails event part for starting seller side accounting which can be posted
+    after receiving final response from PPCS.
+    
+    (Design wiki - https://w.amazon.com/bin/view/ExternalPayments/Profitability/CoP/ASCExpansion/Design/Settlement/)  -->
+    <branch-state name="CHECK_FOR_EARLY_SETTLEMENT" defaultArc="SettlementAfterPaymentProcessorTerminalStatus">
+        <arc actionComplete="SettlementAfterPaymentProcessorTerminalStatus" goto="CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+        <arc actionComplete="EarlySettlementForCaptureWithinGuaranteePeriod" goto="EARLY_SETTLEMENT_POST_EXECUTION_DETAILS_DATA_TO_SEA" />
+    </branch-state>
+    
+    <arh-state name="EARLY_SETTLEMENT_POST_EXECUTION_DETAILS_DATA_TO_SEA" actionRequest="postExecutionDetailsDataToSEA" retryInterval="2m" maxVisits="21">
+        <arc actionComplete="PostDataToSEASuccess" goto="EARLY_SETTLEMENT_POST_TRANSACTION_DATA_TO_SEA" />
+        <arc actionComplete="PostDataToSEANoData" goto="EARLY_SETTLEMENT_POST_EXECUTION_DETAILS_WAIT_STATE" />
+        <arc actionComplete="PostDataToSEAFailure" goto="EARLY_SETTLEMENT_POST_EXECUTION_DETAILS_DATA_TO_SEA::Error::ExecutionError" />
+    </arh-state>
+    
+    <wait-state name="EARLY_SETTLEMENT_POST_EXECUTION_DETAILS_WAIT_STATE" timeout="15s" timeoutArc="TimeoutOccurred" timeoutBackoffFactor="1" maxVisits="20">
+        <arc actionComplete="TimeoutOccurred" goto="EARLY_SETTLEMENT_POST_EXECUTION_DETAILS_DATA_TO_SEA" />
+    </wait-state>    
+    
+    <arh-state name="EARLY_SETTLEMENT_POST_TRANSACTION_DATA_TO_SEA" actionRequest="postTransactionDataToSEA" retryInterval="2m">
+        <arc actionComplete="PostDataToSEASuccess" goto="EARLY_SETTLEMENT_CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+        <arc actionComplete="PostDataToSEAFailure" goto="EARLY_SETTLEMENT_POST_TRANSACTION_DATA_TO_SEA::Error::ExecutionError" />
+    </arh-state>
+    
+    <arh-state name="EARLY_SETTLEMENT_CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" actionRequest="checkCaptureState"
+        maxVisits="5" retryInterval="30s">
+        <!-- Capture is COMPLETE (but PaymentProcessorStatus is not terminal). Wait till the callback is received. -->
+        <arc actionComplete="CaptureCompletedWithPaymentProcessorPendingCallbackResponse" goto="EARLY_SETTLEMENT_PPCS_CALLBACK_WAIT" />
+        <arc actionComplete="CaptureSkippedDueToBuyerFraud" goto="EARLY_SETTLEMENT_TRIGGER_SKIPPED_CAPTURE_RETRY_WORKFLOW" />
+        <arc actionComplete="CaptureCompletedWithBadDebt" goto="EARLY_SETTLEMENT_DECIDE_BAD_DEBT_FOR_CAPTURE" />
+        <arc actionComplete="CaptureCompletedWithBadDebtRecoveryPending" goto="EARLY_SETTLEMENT_TRIGGER_CAPTURE_RETRY_WF" />
+        <arc actionComplete="CaptureCompletedSuccessfully" goto="EARLY_SETTLEMENT_EXECUTION_DETAILS_AVAILABLE_NOTIFICATION" />
+        <arc actionComplete="CapturePaymentProcessorStatusPending" goto="WAIT_FOR_AUTHORIZE_SUCCESS_OR_FAIL" />
+        <arc actionComplete="CheckCaptureStateFailure" goto="EARLY_SETTLEMENT_CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS::Error::ExecutionError" />
+    </arh-state>
+
+    <subgraph-state name="EARLY_SETTLEMENT_TRIGGER_SKIPPED_CAPTURE_RETRY_WORKFLOW" clientId="marketplace-payments-dev" instructionId="MarketplacePaymentSkippedCaptureRetryWorkflow" inheritContext="true">
+        <arc actionComplete="SubgraphExitedViaNO_RETRY_REQUIRED" goto="EARLY_SETTLEMENT_DECIDE_BAD_DEBT_FOR_CAPTURE" />
+        <arc actionComplete="SubgraphExitedViaCAPTURE_RETRIES_COMPLETE" goto="EARLY_SETTLEMENT_CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+        <arc actionComplete="SubgraphExitedViaCAPTURE_COMPLETE" goto="CAPTURE_COMPLETE" />
+        <arc actionComplete="SubgraphExitedViaFailure" goto="EARLY_SETTLEMENT_TRIGGER_SKIPPED_CAPTURE_RETRY_WORKFLOW::Error::ExecutionError" />
+    </subgraph-state>
+
+    <subgraph-state name="EARLY_SETTLEMENT_TRIGGER_CAPTURE_RETRY_WF" clientId="marketplace-payments-dev" instructionId="MarketplacePaymentCaptureRetryWorkflow" inheritContext="true">
+        <arc actionComplete="SubgraphExitedViaNO_RETRY_REQUIRED" goto="EARLY_SETTLEMENT_CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+        <arc actionComplete="SubgraphExitedViaCAPTURE_RETRIES_COMPLETE" goto="EARLY_SETTLEMENT_CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+        <arc actionComplete="SubgraphExitedViaFailure" goto="EARLY_SETTLEMENT_TRIGGER_CAPTURE_RETRY_WF::Error::ExecutionError" />
+    </subgraph-state>
+
+    <wait-state name="EARLY_SETTLEMENT_PPCS_CALLBACK_WAIT" timeout="72h" timeoutArc="TimeoutOccurred"
+        maxVisits="1">
+        <arc actionComplete="PPCSCallbackWaitOver" goto="EARLY_SETTLEMENT_CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" deferralBehavior="mergeAllForward" />
+        <arc actionComplete="TimeoutOccurred" goto="EARLY_SETTLEMENT_CHECK_CAPTURE_STATE_FOR_PAYMENT_PROCESSOR_TERMINAL_STATUS" />
+    </wait-state>
+    
+    <arh-state name="EARLY_SETTLEMENT_DECIDE_BAD_DEBT_FOR_CAPTURE" actionRequest="decideBadDebtForCapture" retryInterval="2m">
+        <arc actionComplete="SkipRegisterBadDebt" goto="RESUME_CHILDREN_REFUND_WORKFLOW"/>
+        <arc actionComplete="RegisterBadDebt" goto="EARLY_SETTLEMENT_REGISTER_BAD_DEBT_ACCOUNTING"/>
+        <arc actionComplete="DecideBadDebtFailure" goto="EARLY_SETTLEMENT_DECIDE_BAD_DEBT_FOR_CAPTURE::Error::ExecutionError" />
+    </arh-state>
+
+    <arh-state name="EARLY_SETTLEMENT_REGISTER_BAD_DEBT_ACCOUNTING" actionRequest="postBadDebtEventToSEA" retryInterval="2m">
+        <!-- Bad Debt is to be registered in accounting for this transaction -->
+        <metadata key="eventType" value="CaptureBadDebtEvent" />
+        <arc actionComplete="Success" goto="RESUME_CHILDREN_REFUND_WORKFLOW"/>
+        <arc actionComplete="Failure" goto="EARLY_SETTLEMENT_REGISTER_BAD_DEBT_ACCOUNTING::Error::ExecutionError" />
+    </arh-state>
+    
+    <arh-state name="EARLY_SETTLEMENT_EXECUTION_DETAILS_AVAILABLE_NOTIFICATION" actionRequest="paymentNotification" retryInterval="30s">
+        <metadata key="eventType" value="CaptureExecutionDetails" />
+        <!-- Early settlement branch will converge at RESUME_CHILDREN_REFUND_WORKFLOW -->    
+        <arc actionComplete="PaymentNotificationSuccess" goto="RESUME_CHILDREN_REFUND_WORKFLOW" />
+        <arc actionComplete="PaymentNotificationFailure" goto="EARLY_SETTLEMENT_EXECUTION_DETAILS_AVAILABLE_NOTIFICATION::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Branch if provider transaction is requested -->
+    <branch-state name="CHECK_FOR_PROVIDER_TRANSACTIONS" defaultArc="NoProviderTransaction">
+        <arc actionComplete="NoProviderTransaction" goto="UPDATE_AUTHORIZE" />
+        <arc actionComplete="HasProviderTransactions" goto="PERSIST_PROVIDER_TRANSACTIONS" />
+    </branch-state>
+	
+    <arh-state name="PERSIST_PROVIDER_TRANSACTIONS" actionRequest="persistProviderTransaction" retryInterval="1s" retryWindow="1s">
+        <arc actionComplete="Success" goto="TRIGGER_PROVIDER_WORKFLOWS"/>
+        <arc actionComplete="PaymentTransactionMerchantStateDeclinedResponse" goto="UPDATE_AUTHORIZE"/>
+        <arc actionComplete="NoProviderTransactionToPersist" goto="PERSIST_PROVIDER_TRANSACTIONS::Error::ExecutionError"/>
+        <arc actionComplete="Failure" goto="PERSIST_PROVIDER_TRANSACTIONS::Error::ExecutionError"/>
+    </arh-state>
+
+    <arh-state name="TRIGGER_PROVIDER_WORKFLOWS" actionRequest="triggerProviderTransactionWorkflows" retryInterval="2m">
+        <metadata key="eventType" value="CaptureExecutionDetails" />
+        <arc actionComplete="Success" goto="UPDATE_AUTHORIZE" />
+        <arc actionComplete="Failure" goto="TRIGGER_PROVIDER_WORKFLOWS::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Send Capture Declined Notification -->
+    <arh-state name="CAPTURE_DECLINED_NOTIFICATION" actionRequest="paymentNotification" retryInterval="30s">
+        <arc actionComplete="PaymentNotificationSuccess" goto="RESUME_CHILDREN_REFUND_WORKFLOW" />
+        <arc actionComplete="PaymentNotificationFailure" goto="CAPTURE_DECLINED_NOTIFICATION::Error::ExecutionError" />
+    </arh-state>
+
+    <!-- Resume child refund transaction workflows, if any -->
+    <arh-state name="RESUME_CHILDREN_REFUND_WORKFLOW"
+        actionRequest="resumeRefundWorkflows" retryInterval="30s">
+        <arc actionComplete="ResumeRefundWorkflowSuccess" goto="POST_FX_REVENUE_TO_FLARE" />
+        <arc actionComplete="ResumeRefundWorkflowFailure" goto="RESUME_CHILDREN_REFUND_WORKFLOW::Error::ExecutionError" />
+    </arh-state>
+
+    <arh-state name="POST_FX_REVENUE_TO_FLARE" actionRequest="postFxRevenue" retryInterval="2m">
+        <arc actionComplete="PostFxRevenueSuccess" goto="CAPTURE_COMPLETE" />
+        <arc actionComplete="PostFxRevenueSkipped" goto="CAPTURE_COMPLETE" />
+        <arc actionComplete="PostFxRevenueFailure" goto="POST_FX_REVENUE_TO_FLARE::Error::ExecutionError" />
+    </arh-state>
+    
+    <close-state name="CAPTURE_COMPLETE" />
+
+    <!-- latency metric for overall workflow without wait-states.
+         MoreInfo:https://w.amazon.com/index.php/Herd/DeveloperGuide/MonitoringWorkflows/FineGrainedGraphMetrics-->
+    <metrics>
+        <latency name="excludeWaitStates" >
+            <workitemfilter>
+                <include type="collection" value="ALL" />
+            </workitemfilter>
+            <statefilter>
+                <include type="collection" value="ALL" />
+                <exclude type="statetype" value="wait-state" />
+            </statefilter>
+        </latency>
+    </metrics>
+</graph>
